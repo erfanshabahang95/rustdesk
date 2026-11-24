@@ -1,0 +1,337 @@
+
+name: RustDesk Windows x64 Build
+
+on:
+  workflow_dispatch:
+
+  push:
+    branches:
+      - master
+    paths:
+      - 'src/**'
+      - 'flutter/**'
+      - 'libs/**'
+      - 'res/**'
+      - 'build.py'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'vcpkg.json'
+      - '.github/workflows/windows-only.yml'
+      - '.github/patches/**'
+
+permissions:
+  contents: read
+
+env:
+  RUST_VERSION: "1.75"
+  LLVM_VERSION: "15.0.6"
+  FLUTTER_VERSION: "3.24.5"
+  VCPKG_COMMIT_ID: "9e593bb18ea69cc5095e012465dcd675a822ed0d"
+  VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
+
+jobs:
+
+  # ------------------------------------------
+  # 1. Generate Flutter Rust Bridge
+  # ------------------------------------------
+
+  generate-bridge:
+    name: Generate Flutter Rust Bridge
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Install prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            ca-certificates clang cmake curl gcc git \
+            g++ libclang-dev libgtk-3-dev llvm-dev \
+            nasm ninja-build pkg-config wget
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          targets: x86_64-unknown-linux-gnu
+          components: rustfmt
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: bridge-ubuntu-22.04
+
+      - name: Install Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: "3.22.3"
+          cache: true
+
+      - name: Install Flutter Rust Bridge
+        shell: bash
+        run: |
+          cargo install cargo-expand --version 1.0.95 --locked
+          cargo install flutter_rust_bridge_codegen \
+            --version 1.80.1 \
+            --features uuid \
+            --locked
+
+      - name: Prepare Flutter dependencies
+        shell: bash
+        run: |
+          sed -i 's/extended_text: 14.0.0/extended_text: 13.0.0/g' flutter/pubspec.yaml
+          cd flutter
+          flutter pub get
+
+      - name: Generate Bridge
+        run: |
+          ~/.cargo/bin/flutter_rust_bridge_codegen \
+            --rust-input ./src/flutter_ffi.rs \
+            --dart-output ./flutter/lib/generated_bridge.dart \
+            --c-output ./flutter/macos/Runner/bridge_generated.h
+
+          cp ./flutter/macos/Runner/bridge_generated.h \
+             ./flutter/ios/Runner/bridge_generated.h
+
+      - name: Upload Bridge
+        uses: actions/upload-artifact@v7
+        with:
+          name: bridge-artifact
+          path: |
+            ./src/bridge_generated.rs
+            ./src/bridge_generated.io.rs
+            ./flutter/lib/generated_bridge.dart
+            ./flutter/lib/generated_bridge.freezed.dart
+            ./flutter/macos/Runner/bridge_generated.h
+            ./flutter/ios/Runner/bridge_generated.h
+
+  # ------------------------------------------
+  # 2. Build RustDeskTempTopMostWindow
+  # ------------------------------------------
+
+  build-topmost:
+    name: Build RustDeskTempTopMostWindow x64
+    runs-on: windows-2022
+
+    steps:
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v3
+
+      - name: Download source
+        shell: pwsh
+        run: |
+          git clone https://github.com/rustdesk-org/RustDeskTempTopMostWindow
+
+      - name: Build DLL
+        shell: pwsh
+        run: |
+          cd RustDeskTempTopMostWindow
+
+          git checkout ecd8d6a139eee76845ea66423fb739af450fda90
+
+          msbuild WindowInjection/WindowInjection.vcxproj `
+            -p:Configuration=Release `
+            -p:Platform=x64 `
+            /p:TargetVersion=Windows10
+
+      - name: Upload DLL
+        uses: actions/upload-artifact@v7
+        with:
+          name: topmostwindow-artifacts-x64
+          path: RustDeskTempTopMostWindow/WindowInjection/x64/Release/WindowInjection.dll
+
+  # ------------------------------------------
+  # 3. Build RustDesk Windows x64
+  # ------------------------------------------
+
+  build-windows:
+    name: Build RustDesk Windows x64
+    runs-on: windows-2022
+
+    needs:
+      - generate-bridge
+      - build-topmost
+
+    steps:
+      - name: Export GitHub Actions cache variables
+        uses: actions/github-script@v8
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+      - name: Checkout source
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Download Bridge
+        uses: actions/download-artifact@v8
+        with:
+          name: bridge-artifact
+          path: ./
+
+      - name: Install LLVM and Clang
+        uses: KyleMayes/install-llvm-action@v2
+        with:
+          version: ${{ env.LLVM_VERSION }}
+
+      - name: Install Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          architecture: x64
+          cache: true
+
+      - name: Prepare Flutter Engine
+        shell: pwsh
+        run: |
+          flutter doctor -v
+          flutter precache --windows
+
+          Invoke-WebRequest `
+            -Uri https://github.com/rustdesk/engine/releases/download/main/windows-x64-release.zip `
+            -OutFile windows-x64-release.zip
+
+          Expand-Archive windows-x64-release.zip -DestinationPath windows-x64-release
+
+          Copy-Item -Path windows-x64-release/* `
+            -Destination "C:/hostedtoolcache/windows/flutter/stable-${{ env.FLUTTER_VERSION }}-x64/bin/cache/artifacts/engine/windows-x64-release/" `
+            -Recurse -Force
+
+      - name: Patch Flutter
+        shell: bash
+        run: |
+          cp .github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff \
+            "$(dirname "$(dirname "$(which flutter)")")"
+
+          cd "$(dirname "$(dirname "$(which flutter)")")"
+
+          if [[ "${{ env.FLUTTER_VERSION }}" == "3.24.5" ]]; then
+            git apply flutter_3.24.4_dropdown_menu_enableFilter.diff
+          fi
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          targets: x86_64-pc-windows-msvc
+          components: rustfmt
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: windows-2022
+
+      - name: Setup vcpkg
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgDirectory: C:\vcpkg
+          vcpkgGitCommitId: ${{ env.VCPKG_COMMIT_ID }}
+          doNotCache: false
+
+      - name: Install vcpkg dependencies
+        shell: bash
+        run: |
+          if ! "$VCPKG_ROOT/vcpkg" \
+            install \
+            --triplet x64-windows-static \
+            --x-install-root="$VCPKG_ROOT/installed"; then
+
+            find "$VCPKG_ROOT/" -name "*.log" | while read -r log; do
+              echo "$log:"
+              cat "$log"
+            done
+
+            exit 1
+          fi
+
+      - name: Build RustDesk
+        shell: pwsh
+        run: |
+          python3 .\build.py `
+            --portable `
+            --flutter `
+            --skip-portable-pack `
+            --hwcodec `
+            --vram
+
+          Move-Item `
+            ./flutter/build/windows/x64/runner/Release `
+            ./rustdesk
+
+      - name: Download USB Display Driver
+        shell: pwsh
+        run: |
+          Invoke-WebRequest `
+            -Uri https://github.com/rustdesk-org/rdev/releases/download/usbmmidd_v2/usbmmidd_v2.zip `
+            -OutFile usbmmidd_v2.zip
+
+          Expand-Archive usbmmidd_v2.zip -DestinationPath .
+
+          Remove-Item -Path usbmmidd_v2/Win32 -Recurse
+
+          Remove-Item -Path `
+            usbmmidd_v2/deviceinstaller64.exe, `
+            usbmmidd_v2/deviceinstaller.exe, `
+            usbmmidd_v2/usbmmidd.bat
+
+          Move-Item -Force ./usbmmidd_v2 ./rustdesk
+
+      - name: Download Printer Drivers
+        shell: pwsh
+        run: |
+          try {
+            Invoke-WebRequest `
+              -Uri https://github.com/rustdesk/hbb_common/releases/download/driver/rustdesk_printer_driver_v4-1.4.zip `
+              -OutFile rustdesk_printer_driver.zip
+
+            Invoke-WebRequest `
+              -Uri https://github.com/rustdesk/hbb_common/releases/download/driver/printer_driver_adapter.zip `
+              -OutFile printer_driver_adapter.zip
+
+            Invoke-WebRequest `
+              -Uri https://github.com/rustdesk/hbb_common/releases/download/driver/sha256sums `
+              -OutFile sha256sums
+
+            $driverHash = (Select-String -Path ./sha256sums -Pattern '^([a-fA-F0-9]{64}) \*rustdesk_printer_driver_v4-1.4\.zip$').Matches.Groups[1].Value
+
+            $adapterHash = (Select-String -Path ./sha256sums -Pattern '^([a-fA-F0-9]{64}) \*printer_driver_adapter\.zip$').Matches.Groups[1].Value
+
+            $actualDriver = (Get-FileHash ./rustdesk_printer_driver.zip -Algorithm SHA256).Hash
+            $actualAdapter = (Get-FileHash ./printer_driver_adapter.zip -Algorithm SHA256).Hash
+
+            if ($driverHash -eq $actualDriver -and $adapterHash -eq $actualAdapter) {
+              Expand-Archive ./rustdesk_printer_driver.zip -DestinationPath .
+              New-Item -ItemType Directory -Force ./rustdesk/drivers
+
+              Move-Item ./rustdesk_printer_driver_v4-1.4 `
+                ./rustdesk/drivers/RustDeskPrinterDriver
+
+              Expand-Archive ./printer_driver_adapter.zip -DestinationPath .
+              Move-Item ./printer_driver_adapter.dll ./rustdesk/
+            }
+          }
+          catch {
+            Write-Warning "Printer driver installation skipped: $_"
+          }
+
+      - name: Download TopMost DLL
+        uses: actions/download-artifact@v8
+        with:
+          name: topmostwindow-artifacts-x64
+          path: ./rustdesk
+
+      - name: Upload Windows x64 Build
+        uses: actions/upload-artifact@v7
+        with:
+          name: rustdesk-windows-x64
+          path: ./rustdesk/
+          if-no-files-found: error
+          retention-days: 7
